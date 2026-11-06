@@ -1,0 +1,478 @@
+# Build an OpenHarmony app from its source repository and publish it to the
+# Oniro App Store, where versions published this way carry the
+# "Built from source" badge.
+#
+# Caller, in the app's repository (.github/workflows/oniro-store.yml):
+#
+#   on:
+#     push:
+#       tags: ['v*']
+#   permissions:
+#     id-token: write
+#     contents: write
+#   jobs:
+#     publish:
+#       uses: eclipse-oniro4openharmony/oniro-app-store-actions/.github/workflows/publish.yml@v1
+#
+# How the badge stays meaningful: the store grants it only to runs whose GitHub
+# OIDC token names this file as the job's workflow (job_workflow_ref). The two
+# jobs below keep the caller's code away from that token: `build` runs the
+# repository's build scripts and dependencies but has no id-token permission;
+# `publish` holds the token but never checks out or runs the caller's code. It
+# hashes the artifact itself and trusts nothing `build` says about it.
+#
+# The steps are all in this file and every action is pinned by commit sha, so
+# the job_workflow_sha the store records identifies the pipeline. The
+# toolchain it installs is pinned by version (oniro-app, and the SDK release
+# for the project's API level), not by hash.
+
+name: Oniro App Store
+
+on:
+  workflow_call:
+    inputs:
+      project-dir:
+        description: Directory of the OpenHarmony project inside the repository (for monorepos).
+        type: string
+        default: .
+      product:
+        description: hvigor product to build.
+        type: string
+        default: default
+      release-name:
+        description: "Title of the GitHub release, when this workflow creates it. Default: the tag."
+        type: string
+        default: ''
+      app-name:
+        description: "Store listing name, used only when the app is published for the first time. Default: the repository name."
+        type: string
+        default: ''
+      category:
+        description: Store category (app or game), used only on first publish.
+        type: string
+        default: app
+      store-url:
+        description: The store to publish to.
+        type: string
+        default: https://store.iparo.app
+    outputs:
+      package-name:
+        description: Bundle name of the published app.
+        value: ${{ jobs.publish.outputs.package-name }}
+      version-code:
+        description: versionCode of the published version.
+        value: ${{ jobs.publish.outputs.version-code }}
+      build-kind:
+        description: ci_source when the store gave the version the "Built from source" badge.
+        value: ${{ jobs.publish.outputs.build-kind }}
+      store-page:
+        description: The app's page on the store.
+        value: ${{ jobs.publish.outputs.store-page }}
+
+permissions: {}
+
+env:
+  # The Oniro CLI installs the toolchain and signs; pinned like everything else.
+  ONIRO_APP_VERSION: 0.19.1
+  ARTIFACT_NAME: oniro-store-package
+
+jobs:
+  build:
+    name: Build from source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      PROJECT_DIR: ${{ inputs.project-dir }}
+      PRODUCT: ${{ inputs.product }}
+    steps:
+      - name: Check inputs
+        run: |
+          case "$PROJECT_DIR" in
+            /* | *..* ) echo "::error::project-dir must be a relative path inside the repository"; exit 1 ;;
+          esac
+          if [[ ! "$PRODUCT" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            echo "::error::product must be an hvigor product name"
+            exit 1
+          fi
+          {
+            echo "ONIRO_SDK_ROOT_DIR=$HOME/setup-ohos-sdk"
+            echo "ONIRO_CMD_TOOLS_PATH=$HOME/command-line-tools"
+            echo "OHOS_BASE_SDK_HOME=$HOME/setup-ohos-sdk/linux"
+          } >> "$GITHUB_ENV"
+
+      - name: Check out the app at ${{ github.sha }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          # No Actions cache: branch builds of the app could seed it (see below).
+          package-manager-cache: false
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Free disk space for the toolchain
+        # The command-line tools and an SDK take ~10 GB unpacked.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h "$HOME"
+
+      - name: Read the project's SDK level
+        id: project
+        working-directory: ${{ inputs.project-dir }}
+        run: |
+          if [ ! -f build-profile.json5 ]; then
+            if [ -f build-profile.example.json5 ]; then
+              echo "Using build-profile.example.json5 (build-profile.json5 is not committed)"
+              cp build-profile.example.json5 build-profile.json5
+            else
+              echo "::error::No build-profile.json5 in '$PROJECT_DIR'"
+              exit 1
+            fi
+          fi
+          # build-profile.json5 is JSON5, a subset of a JavaScript object literal.
+          cat > "$RUNNER_TEMP/sdk-api.cjs" <<'EOF'
+          const fs = require('node:fs');
+          const vm = require('node:vm');
+          const [file, productName] = process.argv.slice(2);
+          const profile = vm.runInNewContext(`(${fs.readFileSync(file, 'utf8')}\n)`, Object.create(null), { timeout: 1000 });
+          const app = (profile && profile.app) || {};
+          const product = (app.products || []).find((p) => p.name === productName);
+          if (!product) {
+            console.error(`::error::product "${productName}" is not defined in ${file}`);
+            process.exit(1);
+          }
+          if ((product.runtimeOS || app.runtimeOS) === 'HarmonyOS') {
+            console.error('::error::HarmonyOS projects are not supported: the store distributes OpenHarmony apps');
+            process.exit(1);
+          }
+          const raw = product.compileSdkVersion ?? app.compileSdkVersion;
+          const api = typeof raw === 'number' ? raw : Number((/\((\d+)\)/.exec(String(raw)) || [null, raw])[1]);
+          if (!Number.isInteger(api)) {
+            console.error(`::error::cannot read compileSdkVersion (${JSON.stringify(raw)}) from ${file}`);
+            process.exit(1);
+          }
+          console.log(api);
+          EOF
+          api=$(node "$RUNNER_TEMP/sdk-api.cjs" build-profile.json5 "$PRODUCT")
+          echo "api=$api" >> "$GITHUB_OUTPUT"
+          echo "Compiles against API $api"
+
+      - name: Install the OpenHarmony toolchain
+        # Installed fresh on every run, never restored from a cache: a cache
+        # written by an earlier build of this repository could carry a modified
+        # toolchain into this one. The SDK download is checked against the
+        # mirror's sha256.
+        env:
+          API: ${{ steps.project.outputs.api }}
+        run: |
+          npm install -g "@oniroproject/oniro-app@${ONIRO_APP_VERSION}"
+          version=$(oniro-app sdk list --json | jq -r --arg api "$API" '.[] | select(.flavour == "OpenHarmony" and .api == $api) | .version' | head -n1)
+          if [ -z "$version" ]; then
+            echo "::error::No OpenHarmony SDK release for API $API is known to oniro-app ${ONIRO_APP_VERSION}"
+            exit 1
+          fi
+          oniro-app cmdtools install
+          oniro-app sdk install "$version"
+          df -h "$HOME"
+
+      - name: Sign with the OpenHarmony development key
+        # The SDK's public key is the identity devices accept for apps outside
+        # Huawei's ecosystem; this overwrites any signingConfigs in the project.
+        run: oniro-app sign "$PROJECT_DIR"
+
+      - name: Build (hvigorw assembleApp, release)
+        working-directory: ${{ inputs.project-dir }}
+        run: |
+          tools="$ONIRO_CMD_TOOLS_PATH/bin"
+          "$tools/ohpm" install --all
+          "$tools/hvigorw" assembleApp --mode project -p product="$PRODUCT" -p buildMode=release --stacktrace --no-daemon
+
+      - name: Package for the store
+        env:
+          OUT_DIR: ${{ runner.temp }}/oniro-store-out
+        working-directory: ${{ inputs.project-dir }}
+        run: |
+          pack_info="build/outputs/$PRODUCT/pack.info"
+          if [ ! -f "$pack_info" ]; then
+            echo "::error::$pack_info not found"
+            exit 1
+          fi
+          bundle=$(jq -r '.summary.app.bundleName' "$pack_info")
+          version=$(jq -r '.summary.app.version.name' "$pack_info")
+          mapfile -t names < <(jq -r '.packages[].name' "$pack_info")
+          if [ "${#names[@]}" -eq 0 ]; then
+            echo "::error::$pack_info lists no packages"
+            exit 1
+          fi
+
+          # hvigor signs the .app container but not the modules inside it, and
+          # a device refuses an unsigned module. So the bundle is rebuilt from
+          # the individually signed modules with a plain zip
+          # (app_packing_tool.jar would rewrite them and break the signatures).
+          stage=$(mktemp -d)
+          files=()
+          for name in "${names[@]}"; do
+            if [[ ! "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "::error::unexpected package name in pack.info: $name"
+              exit 1
+            fi
+            mapfile -t found < <(find . -type d -name oh_modules -prune -o -type f \
+              \( -name "$name-signed.hap" -o -name "$name-signed.hsp" \) \
+              -path "*/build/$PRODUCT/outputs/*" -print)
+            if [ "${#found[@]}" -ne 1 ]; then
+              echo "::error::expected one signed module for $name, found ${#found[@]}: ${found[*]:-none}"
+              exit 1
+            fi
+            module="${found[0]}"
+            if ! LC_ALL=C grep -q --binary-files=text '<hap sign block>' "$module"; then
+              echo "::error::$module is not signed"
+              exit 1
+            fi
+            ext="${module##*.}"
+            cp "$module" "$stage/$name.$ext"
+            files+=("$name.$ext")
+          done
+
+          safe() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+          mkdir -p "$OUT_DIR"
+          if [ "${#files[@]}" -eq 1 ] && [[ "${files[0]}" == *.hap ]]; then
+            # A single module ships as a plain .hap, which every client installs.
+            out="$OUT_DIR/$(safe "$bundle")-$(safe "$version").hap"
+            cp "$stage/${files[0]}" "$out"
+          else
+            out="$OUT_DIR/$(safe "$bundle")-$(safe "$version").app"
+            cp "$pack_info" "$stage/pack.info"
+            (cd "$stage" && zip -X -D -0 -q "$out" pack.info "${files[@]}")
+          fi
+          echo "Packaged $bundle $version as $(basename "$out"): ${files[*]}"
+          sha256sum "$out"
+
+      - name: Hand the package to the publish job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/oniro-store-out/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish
+    needs: build
+    # Branch pushes and pull requests stop after the build: calling this
+    # workflow from them checks that the app builds the way the store builds it.
+    if: >-
+      github.ref_type == 'tag' &&
+      github.event_name != 'pull_request' &&
+      github.event_name != 'pull_request_target'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # One publish per tag at a time: they share the release. (GitHub keeps
+    # one pending job per group, so callers publishing three or more apps
+    # from one tag chain the calls with `needs:`.)
+    concurrency:
+      group: oniro-store-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write # create the release and upload the package
+      id-token: write # prove to the store which repository, commit and workflow this is
+    outputs:
+      package-name: ${{ steps.register.outputs.package-name }}
+      version-code: ${{ steps.register.outputs.version-code }}
+      build-kind: ${{ steps.register.outputs.build-kind }}
+      store-page: ${{ steps.register.outputs.store-page }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    # No checkout: nothing from the app's repository runs in this job.
+    steps:
+      - name: Fetch the package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/package
+
+      - name: Inspect the package
+        id: package
+        env:
+          DIR: ${{ runner.temp }}/package
+        run: |
+          mapfile -t files < <(find "$DIR" -type f)
+          if [ "${#files[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one package, found ${#files[@]}"
+            exit 1
+          fi
+          file="${files[0]}"
+          name=$(basename "$file")
+          if [[ ! "$name" =~ ^[A-Za-z0-9._-]+\.(hap|app)$ ]]; then
+            echo "::error::unexpected package file name: $name"
+            exit 1
+          fi
+          {
+            echo "file=$file"
+            echo "name=$name"
+            echo "size=$(stat -c %s "$file")"
+            echo "sha256=$(sha256sum "$file" | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Attach it to the ${{ github.ref_name }} release
+        id: asset
+        env:
+          FILE: ${{ steps.package.outputs.file }}
+          NAME: ${{ steps.package.outputs.name }}
+          SHA256: ${{ steps.package.outputs.sha256 }}
+          RELEASE_NAME: ${{ inputs.release-name }}
+        run: |
+          release_json="$RUNNER_TEMP/release.json"
+          tag_uri=$(jq -rn --arg t "$TAG" '$t | @uri')
+          # The by-tag endpoint serves published releases only; a draft for the
+          # tag (written by hand or by release-drafter) is found in the list.
+          fetch_release() {
+            gh api "repos/$REPO/releases/tags/$tag_uri" > "$release_json" 2> /dev/null ||
+              gh api "repos/$REPO/releases?per_page=100" |
+              jq -e --arg t "$TAG" 'first(.[] | select(.tag_name == $t and .draft)) // empty' > "$release_json"
+          }
+
+          uploaded=false
+          if fetch_release; then
+            draft=$(jq -r .draft "$release_json")
+            existing=$(jq -c --arg n "$NAME" 'first(.assets[] | select(.name == $n)) // empty' "$release_json")
+            if [ -n "$existing" ]; then
+              if [ "$(jq -r '.digest // ""' <<< "$existing")" != "sha256:$SHA256" ]; then
+                echo "::error::The $TAG release already has a different $NAME. Delete that asset and re-run, or publish from a new tag."
+                exit 1
+              fi
+              # This job re-run on the same build: register the same asset again.
+              echo "The $TAG release already has this exact $NAME"
+            elif [ "$draft" != true ] && [ "$(jq -r '.immutable // false' "$release_json")" = true ]; then
+              echo "::error::The $TAG release is immutable, so the package cannot be added to it. Push the tag without creating a release: this workflow then creates the release with the package attached."
+              exit 1
+            else
+              gh release upload "$TAG" "$FILE" --repo "$REPO"
+              uploaded=true
+            fi
+            if [ "$draft" = true ]; then
+              # The store serves only public assets. The draft keeps its notes.
+              gh api -X PATCH "repos/$REPO/releases/$(jq -r .id "$release_json")" -F draft=false > /dev/null
+              echo "Published the draft release of $TAG"
+            fi
+          else
+            # With a file to attach, gh creates the release as a draft, uploads,
+            # then publishes it, so this works where releases are immutable.
+            gh release create "$TAG" "$FILE" --repo "$REPO" --verify-tag \
+              --title "${RELEASE_NAME:-$TAG}" \
+              --notes "Built from $GITHUB_SHA by $GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID and published to the Oniro App Store."
+            uploaded=true
+          fi
+
+          fetch_release
+          asset_id=$(jq -r --arg n "$NAME" 'first(.assets[] | select(.name == $n)) | .id' "$release_json")
+          if [ -z "$asset_id" ]; then
+            echo "::error::Cannot find $NAME on the $TAG release"
+            exit 1
+          fi
+          {
+            echo "id=$asset_id"
+            echo "uploaded=$uploaded"
+          } >> "$GITHUB_OUTPUT"
+          echo "$NAME is release asset $asset_id"
+
+      - name: Publish to the store
+        id: register
+        env:
+          STORE_URL: ${{ inputs.store-url }}
+          ASSET_ID: ${{ steps.asset.outputs.id }}
+          UPLOADED: ${{ steps.asset.outputs.uploaded }}
+          SHA256: ${{ steps.package.outputs.sha256 }}
+          SIZE: ${{ steps.package.outputs.size }}
+          APP_NAME: ${{ inputs.app-name }}
+          CATEGORY: ${{ inputs.category }}
+          DESCRIPTION: ${{ github.event.repository.description }}
+        run: |
+          store="${STORE_URL%/}"
+          name="${APP_NAME:-${REPO#*/}}"
+          response="$RUNNER_TEMP/response.json"
+          body=$(jq -n \
+            --arg repository "$REPO" --arg tag "$TAG" --arg sha256 "$SHA256" \
+            --argjson assetId "$ASSET_ID" --argjson size "$SIZE" \
+            --arg name "$name" --arg description "$DESCRIPTION" --arg category "$CATEGORY" \
+            '{repository: $repository, tag: $tag, assetId: $assetId, sha256: $sha256, size: $size,
+              app: {name: $name, description: $description, category: $category}}')
+          audience=$(jq -rn --arg a "$store" '$a | @uri')
+
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "::error::No OIDC token available: the calling workflow must grant 'id-token: write'"
+            exit 1
+          fi
+
+          # Network errors, 429, 5xx and 409 CONFLICT (a concurrent registration
+          # won the race; asking again gets the final answer) are worth another
+          # try. Registration is idempotent per asset.
+          retryable() {
+            [[ "$status" == 000 || "$status" == 429 || "$status" == 5?? ]] ||
+              { [ "$status" = 409 ] && jq -e '.error.code == "CONFLICT"' "$response" > /dev/null 2>&1; }
+          }
+          # Four attempts of at most 5 minutes each fit in the job's timeout.
+          attempts=4
+          status=000
+          for attempt in $(seq "$attempts"); do
+            rm -f "$response"
+            # A fresh token per attempt: they expire within minutes.
+            token=$(curl -sSf --max-time 30 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$audience" | jq -r '.value // empty') || token=
+            if [ -z "$token" ]; then
+              status=000
+              echo "Attempt $attempt: GitHub gave no OIDC token"
+            else
+              echo "::add-mask::$token"
+              status=$(curl -sS -o "$response" -w '%{http_code}' --max-time 300 \
+                -X POST "$store/api/v1/publisher/releases" \
+                -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+                --data "$body") || status=000
+            fi
+            if ! retryable || [ "$attempt" -ge "$attempts" ]; then
+              break
+            fi
+            echo "Attempt $attempt: the store answered $status; retrying"
+            sleep $((attempt * 20))
+          done
+
+          if [[ "$status" != 2?? ]]; then
+            if [ "$status" = 000 ]; then
+              message="no answer (network error, timeout, or no OIDC token from GitHub)"
+            else
+              message=$(jq -r '.error | "\(.code): \(.message)"' "$response" 2>/dev/null || head -c 500 "$response" 2>/dev/null || true)
+            fi
+            echo "::error::The store refused the package ($status): $message"
+            if [[ "$status" == 4?? && "$UPLOADED" == true ]] && ! retryable; then
+              # The store will not serve this upload; remove it so that a re-run
+              # after the fix can attach a new build. (Immutable releases keep it.)
+              gh api -X DELETE "repos/$REPO/releases/assets/$ASSET_ID" || true
+            fi
+            exit 1
+          fi
+
+          jq . "$response"
+          pkg=$(jq -r .data.packageName "$response")
+          {
+            echo "package-name=$pkg"
+            echo "version-code=$(jq -r .data.versionCode "$response")"
+            echo "build-kind=$(jq -r .data.buildKind "$response")"
+            echo "store-page=$store/apps/$pkg"
+          } >> "$GITHUB_OUTPUT"
+          jq -r --arg page "$store/apps/$pkg" '.data |
+            "### Published to the Oniro App Store\n\n" +
+            "| | |\n|---|---|\n" +
+            "| App | [\(.packageName)](\($page)) |\n" +
+            "| Version | \(.versionName) (\(.versionCode)) |\n" +
+            "| Status | \(.status)\(if .created then "" else " (already registered)" end) |\n" +
+            "| Build | \(if .buildKind == "ci_source" then "Built from source" else "Hosted on GitHub" end) |\n"' \
+            "$response" >> "$GITHUB_STEP_SUMMARY"
