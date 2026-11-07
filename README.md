@@ -108,9 +108,10 @@ Afterwards, edit the listing on the store.
    `hvigorw assembleApp --mode project -p product=<product> -p buildMode=release`.
 6. Packages the result:
    * a project with a single module ships as `<bundle>-<version>.hap`;
-   * otherwise it ships as `<bundle>-<version>.app`, a zip of the signed modules
-     plus `pack.info`. hvigor's own `.app` contains unsigned modules, which
-     devices refuse.
+   * otherwise it ships as `<bundle>-<version>.app.zip`, a zip of the signed
+     modules plus `pack.info` (the store lists it as an `.app`). hvigor's own
+     `.app` contains unsigned modules, which devices refuse, and GitHub does
+     not accept release assets named `*.app`.
 
 The toolchain (about 4.5 GB of downloads) is installed fresh on every run and
 never restored from a cache, so a cache written by an earlier build cannot

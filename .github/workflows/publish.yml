@@ -248,7 +248,10 @@ jobs:
             out="$OUT_DIR/$(safe "$bundle")-$(safe "$version").hap"
             cp "$stage/${files[0]}" "$out"
           else
-            out="$OUT_DIR/$(safe "$bundle")-$(safe "$version").app"
+            # GitHub refuses release assets named *.app ("name has a file
+            # extension that is not allowed"). The store reads the format from
+            # the contents, so the bundle is named .app.zip, which it is.
+            out="$OUT_DIR/$(safe "$bundle")-$(safe "$version").app.zip"
             cp "$pack_info" "$stage/pack.info"
             (cd "$stage" && zip -X -D -0 -q "$out" pack.info "${files[@]}")
           fi
@@ -312,7 +315,7 @@ jobs:
           fi
           file="${files[0]}"
           name=$(basename "$file")
-          if [[ ! "$name" =~ ^[A-Za-z0-9._-]+\.(hap|app)$ ]]; then
+          if [[ ! "$name" =~ ^[A-Za-z0-9._-]+\.(hap|app\.zip)$ ]]; then
             echo "::error::unexpected package file name: $name"
             exit 1
           fi
