@@ -80,10 +80,38 @@ separate build workflow.
 | `release-name` | the tag | Title of the GitHub release, when the workflow creates it. |
 | `app-name` | repository name | Store listing name. Used only for the first release. |
 | `category` | `app` | `app` or `game`. Used only for the first release. |
+| `developer` | the repository's owner | Developer credit on the listing. Applied on **every** release. |
 | `store-url` | `https://store.iparo.app` | The store to publish to. |
 
 The listing description of a new app is the repository's GitHub description.
 Afterwards, edit the listing on the store.
+
+### Developer credit
+
+The listing credits the account that owns the repository, user or
+organization, by its GitHub display name. The store marks that credit as
+verified, because the release's OIDC token proves the app comes from that
+repository. It follows the repository: a new owner, or a renamed one, shows
+from the next release on. The package's `app.json5` `vendor` is not used, and
+neither is a credit typed on the store's website, which the store refuses for
+apps published from a repository.
+
+Set `developer` when the owner is not the right credit. For a project with no
+single author, name the collective, as the Oniro repositories' copyright
+headers do:
+
+```yaml
+jobs:
+  publish:
+    uses: eclipse-oniro4openharmony/oniro-app-store-actions/.github/workflows/publish.yml@v1
+    with:
+      developer: Eclipse Oniro for OpenHarmony contributors
+```
+
+A declared name is shown as declared, not verified, and links to the
+repository owner's profile. It changes like any other file in the repository,
+through review. Remove the input to go back to the owner. The listing links
+the repository's contributors either way.
 
 ## Outputs
 

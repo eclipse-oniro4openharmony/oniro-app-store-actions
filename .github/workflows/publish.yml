@@ -51,6 +51,10 @@ on:
         description: Store category (app or game), used only on first publish.
         type: string
         default: app
+      developer:
+        description: "Developer credit on the store listing, applied on every release. Default: the account owning the repository, shown as verified. Set it for a collective credit such as 'Eclipse Oniro for OpenHarmony contributors'."
+        type: string
+        default: ''
       store-url:
         description: The store to publish to.
         type: string
@@ -398,17 +402,21 @@ jobs:
           SIZE: ${{ steps.package.outputs.size }}
           APP_NAME: ${{ inputs.app-name }}
           CATEGORY: ${{ inputs.category }}
+          DEVELOPER: ${{ inputs.developer }}
           DESCRIPTION: ${{ github.event.repository.description }}
         run: |
           store="${STORE_URL%/}"
           name="${APP_NAME:-${REPO#*/}}"
           response="$RUNNER_TEMP/response.json"
+          # No developer declared: the store credits the repository's owner.
           body=$(jq -n \
             --arg repository "$REPO" --arg tag "$TAG" --arg sha256 "$SHA256" \
             --argjson assetId "$ASSET_ID" --argjson size "$SIZE" \
             --arg name "$name" --arg description "$DESCRIPTION" --arg category "$CATEGORY" \
+            --arg developer "$DEVELOPER" \
             '{repository: $repository, tag: $tag, assetId: $assetId, sha256: $sha256, size: $size,
-              app: {name: $name, description: $description, category: $category}}')
+              app: {name: $name, description: $description, category: $category}}
+             + (if $developer == "" then {} else {developer: $developer} end)')
           audience=$(jq -rn --arg a "$store" '$a | @uri')
 
           if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
