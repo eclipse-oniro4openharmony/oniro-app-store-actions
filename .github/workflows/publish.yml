@@ -90,6 +90,7 @@ jobs:
     env:
       PROJECT_DIR: ${{ inputs.project-dir }}
       PRODUCT: ${{ inputs.product }}
+      DEVELOPER: ${{ inputs.developer }}
     steps:
       - name: Check inputs
         run: |
@@ -98,6 +99,12 @@ jobs:
           esac
           if [[ ! "$PRODUCT" =~ ^[A-Za-z0-9_-]+$ ]]; then
             echo "::error::product must be an hvigor product name"
+            exit 1
+          fi
+          # The store refuses longer credits, which would only show after the
+          # package is built and attached to the release.
+          if [ "${#DEVELOPER}" -gt 100 ]; then
+            echo "::error::developer must be at most 100 characters"
             exit 1
           fi
           {
