@@ -128,10 +128,8 @@ the repository's contributors either way.
 2. Reads `compileSdkVersion` for the product from `build-profile.json5`. If
    that file is not committed, `build-profile.example.json5` is used.
    A HarmonyOS product is refused: the store distributes OpenHarmony apps.
-   A project that also targets HarmonyOS can add an OpenHarmony product,
-   list it first in `app.products` (signing reads the SDK level from the
-   first product) and name it in `product`. Its other products are left
-   alone.
+   A project that also targets HarmonyOS can add an OpenHarmony product
+   and name it in `product`. Its other products are left alone.
 3. Installs the OpenHarmony command-line tools and the matching SDK with
    [`oniro-app`](https://www.npmjs.com/package/@oniroproject/oniro-app).
 4. Signs with the OpenHarmony SDK's development key
