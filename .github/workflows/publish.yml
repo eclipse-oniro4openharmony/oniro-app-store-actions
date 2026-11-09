@@ -197,7 +197,11 @@ jobs:
       - name: Sign with the OpenHarmony development key
         # The SDK's public key is the identity devices accept for apps outside
         # Huawei's ecosystem; this overwrites any signingConfigs in the project.
-        run: oniro-app sign "$PROJECT_DIR"
+        # --product: without it oniro-app checks the first product's runtimeOS.
+        # (It still reads compileSdkVersion from the first product, so a
+        # project that also targets HarmonyOS lists its OpenHarmony product
+        # first.)
+        run: oniro-app sign --product "$PRODUCT" "$PROJECT_DIR"
 
       - name: Build (hvigorw assembleApp, release)
         working-directory: ${{ inputs.project-dir }}
