@@ -82,6 +82,12 @@ separate build workflow.
 | `category` | `app` | `app` or `game`. Used only for the first release. |
 | `developer` | the repository's owner | Developer credit on the listing. Applied on **every** release. |
 | `store-url` | `https://store.iparo.app` | The store to publish to. |
+| `sdk-archive-url` | the public SDK | https URL of an OpenHarmony SDK `.tar.gz` to build with, such as a full SDK. See [System apps](#system-apps). |
+| `sdk-archive-sha256` | | sha256 of that archive. Required with `sdk-archive-url`. |
+| `apl` | `normal` | APL of the signing profile: `normal`, `system_basic` or `system_core`. |
+| `app-feature` | from `apl` | `hos_normal_app`, or `hos_system_app` (the default above `normal`). |
+| `acls` | | Comma-separated permissions above the APL to allow in the profile. |
+| `app-privilege-capabilities` | | Comma-separated privileges for the profile, e.g. `AllowAppUsePrivilegeExtension`. |
 
 The listing description of a new app is the repository's GitHub description.
 Afterwards, edit the listing on the store.
@@ -113,6 +119,43 @@ repository owner's profile. It changes like any other file in the repository,
 through review. Remove the input to go back to the owner. The listing links
 the repository's contributors either way.
 
+### System apps
+
+The workflow builds with the public OpenHarmony SDK and signs an ordinary app
+(`apl` `normal`, `hos_normal_app`). An app that calls system APIs, such as
+`@ohos.bundle.installer` or `@ohos.systemparameter`, does not compile against
+the public SDK, and one that requests system permissions does not install at
+the normal APL. For those, build with a full SDK and sign at the APL the app
+needs:
+
+```yaml
+jobs:
+  publish:
+    uses: eclipse-oniro4openharmony/oniro-app-store-actions/.github/workflows/publish.yml@v1
+    with:
+      # OpenHarmony 6.1 full SDK (API 23), from the OpenHarmony CI builds.
+      sdk-archive-url: https://cidownload.openharmony.cn/version/Master_Version/OpenHarmony_6.1.0.47/20261031_010437/version-Master_Version-OpenHarmony_6.1.0.47-20261031_010437-ohos-sdk-full_6.1-LTS.tar.gz
+      sdk-archive-sha256: 31b0d09b487fe32ffc2487df3e9b926cd6172607a4151615025189b065ea2de6
+      apl: system_core
+```
+
+The full SDK is not on the release mirror. Take an `ohos-sdk-full` archive
+whose API level is your `compileSdkVersion`, from the
+[OpenHarmony daily builds](https://dcp.openharmony.cn/workbench/cicd/dailybuild/dailylist)
+or a copy you host, and pin its sha256: the run refuses an archive that hashes
+differently or has another API level. CI build archives are not kept forever;
+when the URL stops working the build fails, and a hosted copy with the same
+sha256 is a drop-in replacement. The archive is about 3 GB, which adds a few
+minutes to the build.
+
+The signing key ships with every SDK, so anyone can sign at any APL with it.
+The store therefore reads the provisioning profile back out of each module, and
+a version whose profile grants more than an ordinary app (a system APL,
+`hos_system_app`, ACLs or privileged capabilities) keeps the *Built from source*
+badge but waits for an admin's approval even where source builds are otherwise
+approved at once. The job summary lists what the profile grants, and the
+`status` output is `pending` until then.
+
 ## Outputs
 
 | Output | |
@@ -120,6 +163,7 @@ the repository's contributors either way.
 | `package-name` | Bundle name of the published app. |
 | `version-code` | `versionCode` of the published version. |
 | `build-kind` | `ci_source` when the version got the *Built from source* badge. |
+| `status` | `approved`, or `pending` while the version waits for an admin's review. |
 | `store-page` | The app's page on the store. |
 
 ## What the build does
@@ -131,10 +175,12 @@ the repository's contributors either way.
    A project that also targets HarmonyOS can add an OpenHarmony product
    and name it in `product`. Its other products are left alone.
 3. Installs the OpenHarmony command-line tools and the matching SDK with
-   [`oniro-app`](https://www.npmjs.com/package/@oniroproject/oniro-app).
+   [`oniro-app`](https://www.npmjs.com/package/@oniroproject/oniro-app), or,
+   with `sdk-archive-url`, the SDK archive once its sha256 checks out.
 4. Signs with the OpenHarmony SDK's development key
-   (`oniro-app sign --product <product>`), replacing any `signingConfigs` in
-   the project.
+   (`oniro-app sign --product <product> --apl <apl>`, plus `app-feature`,
+   `acls` and `app-privilege-capabilities` when set), replacing any
+   `signingConfigs` in the project.
 5. Runs `ohpm install --all` and
    `hvigorw assembleApp --mode project -p product=<product> -p buildMode=release`.
 6. Packages the result:
@@ -155,7 +201,8 @@ named commit of the named public repository, on a GitHub-hosted runner. The
 store checks GitHub's signed OIDC token for that, and it records the commit,
 workflow and run. It is provenance, not a review. The build runs the
 repository's own build scripts and dependencies, so the package is whatever
-that commit builds.
+that commit builds. That includes an SDK named in `sdk-archive-url`, which the
+commit's workflow file pins by sha256.
 
 The store grants the badge only when all of these hold:
 
