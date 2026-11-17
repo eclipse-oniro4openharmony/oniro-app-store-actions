@@ -84,7 +84,7 @@ separate build workflow.
 | `store-url` | `https://store.iparo.app` | The store to publish to. |
 | `sdk-archive-url` | the public SDK | https URL of an OpenHarmony SDK `.tar.gz` to build with, such as a full SDK. See [System apps](#system-apps). |
 | `sdk-archive-sha256` | | sha256 of that archive. Required with `sdk-archive-url`. |
-| `apl` | `normal` | APL of the signing profile: `normal`, `system_basic` or `system_core`. |
+| `apl` | `normal` | APL of the signing profile: `normal` (also when empty), `system_basic` or `system_core`. |
 | `app-feature` | from `apl` | `hos_normal_app`, or `hos_system_app` (the default above `normal`). |
 | `acls` | | Comma-separated permissions above the APL to allow in the profile. |
 | `app-privilege-capabilities` | | Comma-separated privileges for the profile, e.g. `AllowAppUsePrivilegeExtension`. |
@@ -163,7 +163,7 @@ approved at once. The job summary lists what the profile grants, and the
 | `package-name` | Bundle name of the published app. |
 | `version-code` | `versionCode` of the published version. |
 | `build-kind` | `ci_source` when the version got the *Built from source* badge. |
-| `status` | `approved`, or `pending` while the version waits for an admin's review. |
+| `status` | The version's review status: `approved`, `pending` while it waits for an admin, or `rejected` (on a re-run after an admin rejected it). |
 | `store-page` | The app's page on the store. |
 
 ## What the build does
