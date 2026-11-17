@@ -59,6 +59,30 @@ on:
         description: The store to publish to.
         type: string
         default: https://store.iparo.app
+      sdk-archive-url:
+        description: "https URL of an OpenHarmony SDK .tar.gz to build with instead of the public SDK release, e.g. an ohos-sdk-full archive for apps that use system APIs. Its API level must be the project's compileSdkVersion. Needs sdk-archive-sha256."
+        type: string
+        default: ''
+      sdk-archive-sha256:
+        description: sha256 of the sdk-archive-url download, checked before it is installed.
+        type: string
+        default: ''
+      apl:
+        description: "Ability Privilege Level of the signing profile: normal, system_basic or system_core. Above normal, the store holds the version for an admin's review."
+        type: string
+        default: normal
+      app-feature:
+        description: "App feature of the signing profile: hos_normal_app or hos_system_app. Default: hos_normal_app for apl normal, hos_system_app above it."
+        type: string
+        default: ''
+      acls:
+        description: Comma-separated permissions above the APL to allow in the signing profile (allowed-acls).
+        type: string
+        default: ''
+      app-privilege-capabilities:
+        description: Comma-separated privileges for the signing profile, e.g. AllowAppUsePrivilegeExtension.
+        type: string
+        default: ''
     outputs:
       package-name:
         description: Bundle name of the published app.
@@ -69,6 +93,9 @@ on:
       build-kind:
         description: ci_source when the store gave the version the "Built from source" badge.
         value: ${{ jobs.publish.outputs.build-kind }}
+      status:
+        description: approved, or pending while the version waits for an admin's review.
+        value: ${{ jobs.publish.outputs.status }}
       store-page:
         description: The app's page on the store.
         value: ${{ jobs.publish.outputs.store-page }}
@@ -91,6 +118,12 @@ jobs:
       PROJECT_DIR: ${{ inputs.project-dir }}
       PRODUCT: ${{ inputs.product }}
       DEVELOPER: ${{ inputs.developer }}
+      SDK_ARCHIVE_URL: ${{ inputs.sdk-archive-url }}
+      SDK_ARCHIVE_SHA256: ${{ inputs.sdk-archive-sha256 }}
+      APL: ${{ inputs.apl }}
+      APP_FEATURE: ${{ inputs.app-feature }}
+      ACLS: ${{ inputs.acls }}
+      PRIVILEGE_CAPABILITIES: ${{ inputs.app-privilege-capabilities }}
     steps:
       - name: Check inputs
         run: |
@@ -105,6 +138,32 @@ jobs:
           # package is built and attached to the release.
           if [ "${#DEVELOPER}" -gt 100 ]; then
             echo "::error::developer must be at most 100 characters"
+            exit 1
+          fi
+          if [ -n "$SDK_ARCHIVE_URL$SDK_ARCHIVE_SHA256" ]; then
+            if [[ ! "$SDK_ARCHIVE_URL" =~ ^https://[^[:space:]]+$ ]]; then
+              echo "::error::sdk-archive-url must be an https URL"
+              exit 1
+            fi
+            if [[ ! "$SDK_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::sdk-archive-sha256 must be the archive's sha256 (64 lowercase hex digits)"
+              exit 1
+            fi
+          fi
+          case "$APL" in
+            normal | system_basic | system_core ) ;;
+            * ) echo "::error::apl must be normal, system_basic or system_core"; exit 1 ;;
+          esac
+          case "$APP_FEATURE" in
+            '' | hos_normal_app | hos_system_app ) ;;
+            * ) echo "::error::app-feature must be hos_normal_app or hos_system_app"; exit 1 ;;
+          esac
+          if [[ ! "$ACLS" =~ ^([A-Za-z0-9._]+(,[A-Za-z0-9._]+)*)?$ ]]; then
+            echo "::error::acls must be comma-separated permission names"
+            exit 1
+          fi
+          if [[ ! "$PRIVILEGE_CAPABILITIES" =~ ^([A-Za-z0-9]+(,[A-Za-z0-9]+)*)?$ ]]; then
+            echo "::error::app-privilege-capabilities must be comma-separated privilege names"
             exit 1
           fi
           {
@@ -180,18 +239,35 @@ jobs:
         # Installed fresh on every run, never restored from a cache: a cache
         # written by an earlier build of this repository could carry a modified
         # toolchain into this one. The SDK download is checked against the
-        # mirror's sha256.
+        # mirror's sha256, or, for sdk-archive-url, against sdk-archive-sha256,
+        # which the caller's workflow file pins at the tagged commit.
         env:
           API: ${{ steps.project.outputs.api }}
         run: |
           npm install -g "@oniroproject/oniro-app@${ONIRO_APP_VERSION}"
-          version=$(oniro-app sdk list --json | jq -r --arg api "$API" '.[] | select(.flavour == "OpenHarmony" and .api == $api) | .version' | head -n1)
-          if [ -z "$version" ]; then
-            echo "::error::No OpenHarmony SDK release for API $API is known to oniro-app ${ONIRO_APP_VERSION}"
-            exit 1
-          fi
           oniro-app cmdtools install
-          oniro-app sdk install "$version"
+          if [ -n "$SDK_ARCHIVE_URL" ]; then
+            archive="$RUNNER_TEMP/ohos-sdk.tar.gz"
+            echo "Downloading $SDK_ARCHIVE_URL"
+            curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 -o "$archive" "$SDK_ARCHIVE_URL"
+            if ! echo "$SDK_ARCHIVE_SHA256  $archive" | sha256sum -c --status; then
+              echo "::error::The SDK archive hashes to $(sha256sum "$archive" | cut -d' ' -f1), not sdk-archive-sha256 $SDK_ARCHIVE_SHA256"
+              exit 1
+            fi
+            oniro-app sdk install --from-archive "$archive" --tmp-dir "$RUNNER_TEMP"
+            rm -f "$archive"
+            if [ ! -d "$OHOS_BASE_SDK_HOME/$API" ]; then
+              echo "::error::The SDK archive is not API $API, the project's compileSdkVersion (installed: $(cd "$OHOS_BASE_SDK_HOME" && printf '%s ' *))"
+              exit 1
+            fi
+          else
+            version=$(oniro-app sdk list --json | jq -r --arg api "$API" '.[] | select(.flavour == "OpenHarmony" and .api == $api) | .version' | head -n1)
+            if [ -z "$version" ]; then
+              echo "::error::No OpenHarmony SDK release for API $API is known to oniro-app ${ONIRO_APP_VERSION}"
+              exit 1
+            fi
+            oniro-app sdk install "$version"
+          fi
           df -h "$HOME"
 
       - name: Sign with the OpenHarmony development key
@@ -199,7 +275,16 @@ jobs:
         # Huawei's ecosystem; this overwrites any signingConfigs in the project.
         # --product: without it oniro-app reads runtimeOS and compileSdkVersion
         # from the first product, which may be a HarmonyOS one.
-        run: oniro-app sign --product "$PRODUCT" "$PROJECT_DIR"
+        # Anyone can sign at any APL with that key, so the store reads the
+        # profile back out of the package and holds a privileged one for review.
+        run: |
+          args=(--product "$PRODUCT" --apl "$APL")
+          if [ -n "$APP_FEATURE" ]; then args+=(--app-feature "$APP_FEATURE"); fi
+          if [ -n "$ACLS" ]; then args+=(--acls "$ACLS"); fi
+          if [ -n "$PRIVILEGE_CAPABILITIES" ]; then
+            args+=(--app-privilege-capabilities "$PRIVILEGE_CAPABILITIES")
+          fi
+          oniro-app sign "${args[@]}" "$PROJECT_DIR"
 
       - name: Build (hvigorw assembleApp, release)
         working-directory: ${{ inputs.project-dir }}
@@ -303,6 +388,7 @@ jobs:
       package-name: ${{ steps.register.outputs.package-name }}
       version-code: ${{ steps.register.outputs.version-code }}
       build-kind: ${{ steps.register.outputs.build-kind }}
+      status: ${{ steps.register.outputs.status }}
       store-page: ${{ steps.register.outputs.store-page }}
     env:
       GH_TOKEN: ${{ github.token }}
@@ -486,6 +572,7 @@ jobs:
             echo "package-name=$pkg"
             echo "version-code=$(jq -r .data.versionCode "$response")"
             echo "build-kind=$(jq -r .data.buildKind "$response")"
+            echo "status=$(jq -r .data.status "$response")"
             echo "store-page=$store/apps/$pkg"
           } >> "$GITHUB_OUTPUT"
           jq -r --arg page "$store/apps/$pkg" '.data |
@@ -494,5 +581,8 @@ jobs:
             "| App | [\(.packageName)](\($page)) |\n" +
             "| Version | \(.versionName) (\(.versionCode)) |\n" +
             "| Status | \(.status)\(if .created then "" else " (already registered)" end) |\n" +
-            "| Build | \(if .buildKind == "ci_source" then "Built from source" else "Hosted on GitHub" end) |\n"' \
+            "| Build | \(if .buildKind == "ci_source" then "Built from source" else "Hosted on GitHub" end) |\n" +
+            (if (.privileges // []) == [] then "" else
+              "\nWaits for review by an admin: the signing profile grants " +
+              ((.privileges // []) | join("; ")) + ".\n" end)' \
             "$response" >> "$GITHUB_STEP_SUMMARY"
