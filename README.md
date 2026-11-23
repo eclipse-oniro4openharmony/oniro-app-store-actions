@@ -88,6 +88,9 @@ separate build workflow.
 | `app-feature` | from `apl` | `hos_normal_app`, or `hos_system_app` (the default above `normal`). |
 | `acls` | | Comma-separated permissions above the APL to allow in the profile. |
 | `app-privilege-capabilities` | | Comma-separated privileges for the profile, e.g. `AllowAppUsePrivilegeExtension`. |
+| `submodules` | `false` | Check out submodules: `false`, `true` or `recursive`. |
+| `prebuild` | | Bash script, relative to `project-dir`, run before hvigor. See [Native dependencies](#native-dependencies). |
+| `build-timeout-minutes` | `90` | Time limit of the build job, at most 360 on GitHub-hosted runners. |
 
 The listing description of a new app is the repository's GitHub description.
 Afterwards, edit the listing on the store.
@@ -168,7 +171,8 @@ approved at once. The job summary lists what the profile grants, and the
 
 ## What the build does
 
-1. Checks out the tagged commit (`persist-credentials: false`).
+1. Checks out the tagged commit (`persist-credentials: false`), with its
+   submodules if `submodules` is set.
 2. Reads `compileSdkVersion` for the product from `build-profile.json5`. If
    that file is not committed, `build-profile.example.json5` is used.
    A HarmonyOS product is refused: the store distributes OpenHarmony apps.
@@ -177,13 +181,14 @@ approved at once. The job summary lists what the profile grants, and the
 3. Installs the OpenHarmony command-line tools and the matching SDK with
    [`oniro-app`](https://www.npmjs.com/package/@oniroproject/oniro-app), or,
    with `sdk-archive-url`, the SDK archive once its sha256 checks out.
-4. Signs with the OpenHarmony SDK's development key
+4. Runs the `prebuild` script, if one is set.
+5. Signs with the OpenHarmony SDK's development key
    (`oniro-app sign --product <product> --apl <apl>`, plus `app-feature`,
    `acls` and `app-privilege-capabilities` when set), replacing any
    `signingConfigs` in the project.
-5. Runs `ohpm install --all` and
+6. Runs `ohpm install --all` and
    `hvigorw assembleApp --mode project -p product=<product> -p buildMode=release`.
-6. Packages the result:
+7. Packages the result:
    * a project with a single module ships as `<bundle>-<version>.hap`;
    * otherwise it ships as `<bundle>-<version>.app.zip`, a zip of the signed
      modules plus `pack.info` (the store lists it as an `.app`). hvigor's own
@@ -200,8 +205,8 @@ change this one.
 named commit of the named public repository, on a GitHub-hosted runner. The
 store checks GitHub's signed OIDC token for that, and it records the commit,
 workflow and run. It is provenance, not a review. The build runs the
-repository's own build scripts and dependencies, so the package is whatever
-that commit builds. That includes an SDK named in `sdk-archive-url`, which the
+repository's own build scripts and dependencies, a `prebuild` script
+included, so the package is whatever that commit builds. That includes an SDK named in `sdk-archive-url`, which the
 commit's workflow file pins by sha256.
 
 The store grants the badge only when all of these hold:
@@ -228,6 +233,38 @@ and verifies the package as it does any upload. It re-checks the release asset
 daily. A version whose asset disappears is hidden until the asset is back.
 One whose bytes change is withdrawn, and comes back only if a store admin's
 re-check finds the original bytes again.
+
+## Native dependencies
+
+An app that links native libraries built outside hvigor, such as a C library
+with its own autotools build, builds them in a `prebuild` script. The script
+runs after the toolchain is installed and before signing and hvigor, with
+`project-dir` as the working directory and these variables set:
+
+| Variable | |
+|---|---|
+| `OHOS_SDK_API` | The project's `compileSdkVersion`. |
+| `OHOS_NDK_HOME` | The SDK's `native` directory: clang, the sysroot and `build/cmake/ohos.toolchain.cmake`. |
+| `OHOS_BASE_SDK_HOME` | The directory holding the SDK, one subdirectory per API level. |
+
+The runner is a fresh `ubuntu-24.04` machine (4 CPUs and 16 GB for a public
+repository) with passwordless `sudo`, so the script can `apt-get install` its
+build tools. Nothing is cached between runs, so it builds everything every
+time: set `build-timeout-minutes` to fit.
+
+```yaml
+jobs:
+  publish:
+    uses: eclipse-oniro4openharmony/oniro-app-store-actions/.github/workflows/publish.yml@v1
+    with:
+      submodules: true
+      prebuild: scripts/build_native.sh
+      build-timeout-minutes: 240
+```
+
+The script is the commit's own code, like the hvigor build. It runs in the
+build job with `contents: read` only, and what it downloads is part of what
+the commit builds: pin sources by hash.
 
 ## Monorepos
 
