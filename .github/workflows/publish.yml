@@ -85,6 +85,18 @@ on:
         description: Comma-separated privileges for the signing profile, e.g. AllowAppUsePrivilegeExtension.
         type: string
         default: ''
+      submodules:
+        description: "Check out the repository's submodules: false, true, or recursive."
+        type: string
+        default: 'false'
+      prebuild:
+        description: "Path of a bash script, relative to project-dir, to run before hvigor, e.g. to build native libraries the project links against. It runs in the build job with the toolchain installed; OHOS_SDK_API and OHOS_NDK_HOME name the SDK's API level and native directory."
+        type: string
+        default: ''
+      build-timeout-minutes:
+        description: Time limit of the build job in minutes, at most 360 on GitHub-hosted runners. Raise it for a long prebuild.
+        type: number
+        default: 90
     outputs:
       package-name:
         description: Bundle name of the published app.
@@ -113,7 +125,7 @@ jobs:
   build:
     name: Build from source
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: ${{ inputs.build-timeout-minutes }}
     permissions:
       contents: read
     env:
@@ -126,6 +138,8 @@ jobs:
       APP_FEATURE: ${{ inputs.app-feature }}
       ACLS: ${{ inputs.acls }}
       PRIVILEGE_CAPABILITIES: ${{ inputs.app-privilege-capabilities }}
+      SUBMODULES: ${{ inputs.submodules }}
+      PREBUILD: ${{ inputs.prebuild }}
     steps:
       - name: Check inputs
         run: |
@@ -169,6 +183,19 @@ jobs:
             echo "::error::app-privilege-capabilities must be comma-separated privilege names"
             exit 1
           fi
+          case "$SUBMODULES" in
+            false | true | recursive ) ;;
+            * ) echo "::error::submodules must be false, true or recursive"; exit 1 ;;
+          esac
+          if [ -n "$PREBUILD" ]; then
+            case "$PREBUILD" in
+              /* | *..* ) echo "::error::prebuild must be a relative path inside project-dir"; exit 1 ;;
+            esac
+            if [[ ! "$PREBUILD" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+              echo "::error::prebuild must be a path of letters, digits, '.', '_', '-' and '/'"
+              exit 1
+            fi
+          fi
           {
             echo "ONIRO_SDK_ROOT_DIR=$HOME/setup-ohos-sdk"
             echo "ONIRO_CMD_TOOLS_PATH=$HOME/command-line-tools"
@@ -179,6 +206,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          submodules: ${{ inputs.submodules }}
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -277,6 +305,23 @@ jobs:
           else
             oniro-app sdk install "$version"
           fi
+          df -h "$HOME"
+
+      - name: Run the prebuild script
+        # The caller's own code, like the hvigor build below: it runs with
+        # contents: read only, and its output is part of what the commit builds.
+        # Before signing, so the signing config hvigor uses is oniro-app's.
+        if: inputs.prebuild != ''
+        working-directory: ${{ inputs.project-dir }}
+        env:
+          OHOS_SDK_API: ${{ steps.project.outputs.api }}
+        run: |
+          if [ ! -f "$PREBUILD" ]; then
+            echo "::error::prebuild script '$PREBUILD' not found in '$PROJECT_DIR'"
+            exit 1
+          fi
+          export OHOS_NDK_HOME="$OHOS_BASE_SDK_HOME/$OHOS_SDK_API/native"
+          bash "$PREBUILD"
           df -h "$HOME"
 
       - name: Sign with the OpenHarmony development key
